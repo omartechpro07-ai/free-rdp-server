@@ -6,32 +6,16 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Download & Extract ngrok
-        shell: pwsh
+      - name: Download ngrok
         run: |
-          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile "ngrok.zip"
-          Expand-Archive -Path "ngrok.zip" -DestinationPath "." -Force
+          Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip -OutFile ngrok.zip
+          Expand-Archive ngrok.zip
+          ./ngrok.exe authtoken YOUR_AUTH_TOKEN
 
-          # Find ngrok.exe wherever it was extracted
-          $ngrok = Get-ChildItem -Path "." -Recurse -Filter "ngrok.exe" | Select-Object -First 1
-          if (-not $ngrok) {
-            Write-Error "ngrok.exe not found after extracting ngrok.zip"
-            exit 1
-          }
-
-          Write-Host "ngrok path: $($ngrok.FullName)"
-          & $ngrok.FullName version
-
-      - name: Configure ngrok token (from Secrets)
-        shell: pwsh
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      - name: Enable RDP
         run: |
-          if (-not $env:NGROK_AUTHTOKEN) {
-            Write-Error "Missing secret NGROK_AUTHTOKEN. Add it in Repo Settings > Secrets and variables > Actions."
-            exit 1
-          }
-
-          $ngrok = Get-ChildItem -Path "." -Recurse -Filter "ngrok.exe" | Select-Object -First 1
-          & $ngrok.FullName config add-authtoken $env:NGROK_AUTHTOKEN
-          Write-Host "ngrok token configured."
+          net user kamel123 MyStrong123 /add
+          net localgroup administrators kamel123 /add
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          ./ngrok.exe tcp 3389

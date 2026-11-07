@@ -1,15 +1,15 @@
-# -*- coding: utf-8 -*-
 import os
 import re
 import io
 import time
+import json
 import asyncio
 import logging
 from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image
-from aiohttp import web
+from aiohttp import web, ClientSession
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -18,6 +18,7 @@ BASE = "https://dootsport.co/"
 TOKEN = os.getenv("BOT_TOKEN", "8756140722:AAFIr-OXKcdGQQb7nL0CD14fdgjLvlwJdAQ").strip()
 PORT = int(os.getenv("PORT", 8080))
 HOST = "0.0.0.0"
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "https://kora-live-api.onrender.com").strip()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
@@ -48,12 +49,14 @@ TOP_TEAMS = [
     "الهلال", "النصر", "الاتحاد", "الأهلي السعودي", "الاهلي السعودي", "الشباب", "الاتفاق", "القادسية", "التعاون"
 ]
 
+# ذاكرة التخزين المسبق فائقة السرعة
 MATCHES_CACHE = {
     "yesterday": [],
     "today": [],
     "tomorrow": [],
     "last_updated": 0
 }
+CACHED_JSON_BYTES = b'{"status":"init","matches":{"yesterday":[],"today":[],"tomorrow":[]}}'
 
 # ================= Scraper Engine =================
 def clean(s):
@@ -197,8 +200,9 @@ def scrape_day(day, urls):
     return out
 
 def update_cache():
+    global CACHED_JSON_BYTES
     try:
-        logging.info("Updating matches cache from DotSport...")
+        logging.info("Updating matches cache in background...")
         soup = BeautifulSoup(fetch(BASE), "html.parser")
         links = day_links(soup)
         yesterday_data = scrape_day("yesterday", links)
@@ -209,6 +213,23 @@ def update_cache():
         MATCHES_CACHE["today"] = today_data
         MATCHES_CACHE["tomorrow"] = tomorrow_data
         MATCHES_CACHE["last_updated"] = time.time()
+
+        payload = {
+            "status": "success",
+            "last_updated": MATCHES_CACHE["last_updated"],
+            "counts": {
+                "yesterday": len(yesterday_data),
+                "today": len(today_data),
+                "tomorrow": len(tomorrow_data)
+            },
+            "matches": {
+                "yesterday": yesterday_data,
+                "today": today_data,
+                "tomorrow": tomorrow_data
+            }
+        }
+        # تخزين مسبق للبيانات كبايتات جاهزة في الذاكرة لتفادي أي ضغط معالجة
+        CACHED_JSON_BYTES = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         logging.info("Cache successfully updated! (Yesterday: %d, Today: %d, Tomorrow: %d)",
                      len(yesterday_data), len(today_data), len(tomorrow_data))
     except Exception as e:
@@ -252,26 +273,11 @@ async def api_get_matches(request):
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
-        "Cache-Control": "public, max-age=60",
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "public, max-age=180",
     }
-    if time.time() - MATCHES_CACHE["last_updated"] > 300:
-        asyncio.get_event_loop().run_in_executor(None, update_cache)
-
-    payload = {
-        "status": "success",
-        "last_updated": MATCHES_CACHE["last_updated"],
-        "counts": {
-            "yesterday": len(MATCHES_CACHE["yesterday"]),
-            "today": len(MATCHES_CACHE["today"]),
-            "tomorrow": len(MATCHES_CACHE["tomorrow"])
-        },
-        "matches": {
-            "yesterday": MATCHES_CACHE["yesterday"],
-            "today": MATCHES_CACHE["today"],
-            "tomorrow": MATCHES_CACHE["tomorrow"]
-        }
-    }
-    return web.json_response(payload, headers=headers)
+    # إرجاع فوري من الذاكرة العشوائية RAM (صفر استهلاك معالج، يتحمل آلاف الزوار في نفس الثانية)
+    return web.Response(body=CACHED_JSON_BYTES, status=200, headers=headers)
 
 async def api_options(request):
     headers = {
@@ -325,7 +331,7 @@ async def send_matches_to_tg(update: Update, label, matches):
 async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("⏳ مرحباً بك! جارٍ جلب أهم مباريات الدوريات الكبرى والدوري السعودي...")
-    if time.time() - MATCHES_CACHE["last_updated"] > 300 or not MATCHES_CACHE["today"]:
+    if not MATCHES_CACHE["today"]:
         await asyncio.get_event_loop().run_in_executor(None, update_cache)
     await send_matches_to_tg(update, "اليوم", MATCHES_CACHE["today"])
     await send_matches_to_tg(update, "الغد", MATCHES_CACHE["tomorrow"])
@@ -340,14 +346,28 @@ async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-# ============ Background Scheduler ============
+# ============ Background Schedulers ============
 async def background_cache_worker():
+    """تحديث الكاش تلقائياً كل 5 دقائق في الخلفية بدون انتظار دخول الزوار"""
     while True:
         try:
             await asyncio.get_event_loop().run_in_executor(None, update_cache)
         except Exception as e:
             logging.error("Worker error: %s", e)
-        await asyncio.sleep(300)
+        await asyncio.sleep(300) # 300 ثانية = 5 دقائق
+
+async def keep_awake_worker():
+    """إرسال طلب خارجي ذاتي كل 9 دقائق لمنع Render من النوم نهائياً"""
+    await asyncio.sleep(60) # انتظر دقيقة بعد الإقلاع
+    while True:
+        try:
+            ping_url = f"{SELF_URL}/"
+            async with ClientSession() as session:
+                async with session.get(ping_url, timeout=15) as resp:
+                    logging.info("Keep-Awake Ping sent to %s, status: %d", ping_url, resp.status)
+        except Exception as e:
+            logging.warning("Keep-Awake Ping error: %s", e)
+        await asyncio.sleep(540) # كل 9 دقائق (أقل من الـ 15 دقيقة المحددة للخمول)
 
 # ============ Main Entry ============
 async def main_async():
@@ -361,7 +381,9 @@ async def main_async():
     await site.start()
     logging.info("🚀 Web API Server is running on http://%s:%d/api/matches", HOST, PORT)
 
+    # تشغيل مهمة التحديث التلقائي ومهمة إبقاء السيرفر صاحياً في الخلفية
     asyncio.create_task(background_cache_worker())
+    asyncio.create_task(keep_awake_worker())
 
     if TOKEN:
         tg_app = Application.builder().token(TOKEN).build()

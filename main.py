@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import io
@@ -14,7 +15,11 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= Configuration =================
-BASE = "https://dootsport.co/"
+BASE = "https://kooralive.la/"
+MATCHES_TODAY_URL = "https://kooralive.la/matches-today/"
+MATCHES_YESTERDAY_URL = "https://kooralive.la/matches-yesterday/"
+MATCHES_TOMORROW_URL = "https://kooralive.la/matches-tomorrow/"
+
 TOKEN = os.getenv("BOT_TOKEN", "8756140722:AAFIr-OXKcdGQQb7nL0CD14fdgjLvlwJdAQ").strip()
 PORT = int(os.getenv("PORT", 8080))
 HOST = "0.0.0.0"
@@ -26,8 +31,6 @@ HEADERS = {
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
 
-TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b", re.I)
-SCORE_RE = re.compile(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 TARGET_KEYWORDS = [
@@ -49,7 +52,6 @@ TOP_TEAMS = [
     "الهلال", "النصر", "الاتحاد", "الأهلي السعودي", "الاهلي السعودي", "الشباب", "الاتفاق", "القادسية", "التعاون"
 ]
 
-# ذاكرة التخزين المسبق فائقة السرعة
 MATCHES_CACHE = {
     "yesterday": [],
     "today": [],
@@ -68,54 +70,6 @@ def fetch(url):
     r.encoding = r.apparent_encoding or "utf-8"
     return r.text
 
-def txt(node):
-    return clean(node.get_text(" ", strip=True)) if node else ""
-
-def day_links(soup):
-    result = {"yesterday": [], "today": [], "tomorrow": []}
-    words = {
-        "yesterday": ["الأمس", "امس", "yesterday"],
-        "today": ["اليوم", "today"],
-        "tomorrow": ["الغد", "غدا", "غداً", "tomorrow"],
-    }
-    for a in soup.find_all("a", href=True):
-        label = txt(a).lower()
-        url = urljoin(BASE, a["href"])
-        if not url.startswith(BASE):
-            continue
-        for day, aliases in words.items():
-            if any(x.lower() in label for x in aliases) and url not in result[day]:
-                result[day].append(url)
-    if not result["today"]:
-        result["today"] = [BASE]
-    return result
-
-def is_card(node):
-    s = txt(node)
-    if not s or len(s) > 1800:
-        return False
-    signal = bool(
-        TIME_RE.search(s)
-        or SCORE_RE.search(s)
-        or any(x in s.lower() for x in ["مباشر", "لم تبدأ", "انتهت", "live", "finished", "تأجيل"])
-    )
-    return signal and len(node.find_all("img")) >= 1
-
-def cards(soup):
-    tags = ["article", "li", "div", "a"]
-    out = []
-    seen = set()
-    for node in soup.find_all(tags):
-        if not is_card(node):
-            continue
-        if any(is_card(c) for c in node.find_all(tags, recursive=False)):
-            continue
-        s = txt(node)
-        if s and s not in seen:
-            seen.add(s)
-            out.append(node)
-    return out
-
 def is_target_match(m):
     full_text = f"{m.get('league', '')} {' '.join(m.get('teams', []))}".lower()
     for kw in TARGET_KEYWORDS:
@@ -127,87 +81,95 @@ def is_target_match(m):
                 return True
     return False
 
-def parse_card(card):
-    s = txt(card)
-    teams = []
-    logos = []
-    for im in card.find_all("img"):
-        n = clean(im.get("alt") or im.get("title") or "")
-        n = re.sub(r"\.(png|jpg|jpeg|webp|svg)(\?.*)?$", "", n, flags=re.I)
-        if n and n not in teams:
-            teams.append(n)
-        logo = im.get("data-src") or im.get("src") or ""
-        if logo and not logo.startswith("data:image"):
-            logo = urljoin(BASE, logo)
-            if logo not in logos:
-                logos.append(logo)
+def parse_aya_match(card):
+    # الفريق الأول
+    tm1_node = card.select_one(".MT_Team.TM1")
+    t1_name = clean(tm1_node.select_one(".TM_Name").get_text()) if tm1_node and tm1_node.select_one(".TM_Name") else "الفريق الأول"
+    t1_img = tm1_node.select_one(".TM_Logo img") if tm1_node else None
+    t1_logo = (t1_img.get("data-src") or t1_img.get("src") or "") if t1_img else ""
+    if t1_logo.startswith("data:image"):
+        t1_logo = t1_img.get("data-src") or ""
 
-    links = [urljoin(BASE, a["href"]) for a in card.find_all("a", href=True)]
-    status = next(
-        (x for x in ["لم تبدأ بعد", "لم تبدأ", "مباشر", "انتهت", "تأجيل", "تأجلت", "Live", "Finished"]
-         if x.lower() in s.lower()),
-        "لم تبدأ بعد",
-    )
-    channel = next(
-        (clean(line) for line in card.stripped_strings
-         if re.search(r"beIN|SSC|أبو ظبي|الكأس|القناة|Shahid|ON Sport", line, re.I)),
-        "قناة غير محددة",
-    )
-    league = next(
-        (clean(line) for line in card.stripped_strings
-         if re.search(r"دوري|كأس|بطولة|league|cup|champions", line, re.I)),
-        "مباراة ودية / دوري ممتاز",
-    )
-    tm = TIME_RE.search(s)
-    score = SCORE_RE.search(s)
+    # الفريق الثاني
+    tm2_node = card.select_one(".MT_Team.TM2")
+    t2_name = clean(tm2_node.select_one(".TM_Name").get_text()) if tm2_node and tm2_node.select_one(".TM_Name") else "الفريق الثاني"
+    t2_img = tm2_node.select_one(".TM_Logo img") if tm2_node else None
+    t2_logo = (t2_img.get("data-src") or t2_img.get("src") or "") if t2_img else ""
+    if t2_logo.startswith("data:image"):
+        t2_logo = t2_img.get("data-src") or ""
 
-    team1 = teams[0] if len(teams) > 0 else "الفريق الأول"
-    team2 = teams[1] if len(teams) > 1 else "الفريق الثاني"
-    logo1 = logos[0] if len(logos) > 0 else ""
-    logo2 = logos[1] if len(logos) > 1 else ""
+    # التوقيت
+    time_node = card.select_one(".MT_Time")
+    match_time = clean(time_node.get_text()) if time_node else "00:00"
+
+    # النتيجة
+    goals = card.select(".RS-goals")
+    if len(goals) >= 2:
+        score = f"{clean(goals[0].get_text())}-{clean(goals[1].get_text())}"
+    else:
+        score_node = card.select_one(".MT_Result")
+        score = clean(score_node.get_text()) if score_node else "0-0"
+
+    # الحالة
+    stat_node = card.select_one(".MT_Stat")
+    raw_stat = clean(stat_node.get_text()) if stat_node else "لم تبدأ بعد"
+    if "جارية" in raw_stat or "live" in raw_stat.lower() or "مباشر" in raw_stat:
+        status = "مباشر"
+    elif "انتهت" in raw_stat or "finished" in raw_stat.lower():
+        status = "انتهت"
+    else:
+        status = "لم تبدأ بعد"
+
+    # المعلومات الإضافية (القناة، المعلق، البطولة)
+    info_items = [clean(s.get_text()) for s in card.select(".MT_Info ul li span")]
+    channel = info_items[0] if len(info_items) > 0 else "beIN SPORTS"
+    league = info_items[2] if len(info_items) > 2 else (info_items[1] if len(info_items) > 1 else "الدوري الممتاز")
+
+    # رابط البث المباشر
+    link_node = card.find("a", href=True)
+    stream_url = link_node["href"] if link_node else BASE
 
     return {
-        "teams": [team1, team2],
-        "team1": team1,
-        "team2": team2,
-        "logos": [logo1, logo2],
-        "logo1": logo1,
-        "logo2": logo2,
-        "time": tm.group(0) if tm else "00:00",
-        "score": score.group(0) if score else "0 - 0",
+        "teams": [t1_name, t2_name],
+        "team1": t1_name,
+        "team2": t2_name,
+        "logos": [t1_logo, t2_logo],
+        "logo1": t1_logo,
+        "logo2": t2_logo,
+        "time": match_time,
+        "score": score,
         "status": status,
         "channel": channel,
         "league": league,
-        "url": links[0] if links else BASE,
+        "url": stream_url,
     }
 
-def scrape_day(day, urls):
+def scrape_kooralive_page(url):
     out = []
     seen = set()
-    for url in urls.get(day, []):
-        try:
-            soup = BeautifulSoup(fetch(url), "html.parser")
-            for card in cards(soup):
-                m = parse_card(card)
-                if not is_target_match(m):
-                    continue
-                key = (tuple(m["teams"]), m["time"])
-                if key not in seen:
-                    seen.add(key)
-                    out.append(m)
-        except Exception as e:
-            logging.warning("Scrape error on %s: %s", url, e)
+    try:
+        html = fetch(url)
+        soup = BeautifulSoup(html, "html.parser")
+        match_cards = soup.select(".AY_Match")
+        for card in match_cards:
+            m = parse_aya_match(card)
+            if not is_target_match(m):
+                continue
+            key = (tuple(m["teams"]), m["time"])
+            if key not in seen:
+                seen.add(key)
+                out.append(m)
+    except Exception as e:
+        logging.warning("Error scraping %s: %s", url, e)
     return out
 
 def update_cache():
     global CACHED_JSON_BYTES
     try:
-        logging.info("Updating matches cache in background...")
-        soup = BeautifulSoup(fetch(BASE), "html.parser")
-        links = day_links(soup)
-        yesterday_data = scrape_day("yesterday", links)
-        today_data = scrape_day("today", links)
-        tomorrow_data = scrape_day("tomorrow", links)
+        logging.info("Updating matches cache from KooraLive.la...")
+        today_data = scrape_kooralive_page(MATCHES_TODAY_URL)
+        yesterday_data = scrape_kooralive_page(MATCHES_YESTERDAY_URL)
+        tomorrow_data = scrape_kooralive_page(MATCHES_TOMORROW_URL)
 
         MATCHES_CACHE["yesterday"] = yesterday_data
         MATCHES_CACHE["today"] = today_data
@@ -228,12 +190,11 @@ def update_cache():
                 "tomorrow": tomorrow_data
             }
         }
-        # تخزين مسبق للبيانات كبايتات جاهزة في الذاكرة لتفادي أي ضغط معالجة
         CACHED_JSON_BYTES = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        logging.info("Cache successfully updated! (Yesterday: %d, Today: %d, Tomorrow: %d)",
+        logging.info("KooraLive Cache updated! (Yesterday: %d, Today: %d, Tomorrow: %d)",
                      len(yesterday_data), len(today_data), len(tomorrow_data))
     except Exception as e:
-        logging.error("Failed to update cache: %s", e)
+        logging.error("Failed to update KooraLive cache: %s", e)
 
 # ============ Image Combine ============
 def download_image(url, timeout=10):
@@ -276,7 +237,6 @@ async def api_get_matches(request):
         "Content-Type": "application/json; charset=utf-8",
         "Cache-Control": "public, max-age=180",
     }
-    # إرجاع فوري من الذاكرة العشوائية RAM (صفر استهلاك معالج، يتحمل آلاف الزوار في نفس الثانية)
     return web.Response(body=CACHED_JSON_BYTES, status=200, headers=headers)
 
 async def api_options(request):
@@ -288,7 +248,7 @@ async def api_options(request):
     return web.Response(status=200, headers=headers)
 
 async def api_health(request):
-    return web.Response(text="Bot & API Server is Healthy and Running ⚽", status=200)
+    return web.Response(text="KooraLive API Server is Healthy and Running ⚽", status=200)
 
 # ============ Telegram Bot Handlers ============
 def match_caption(i, m):
@@ -300,7 +260,7 @@ def match_caption(i, m):
         f"📺 القناة: {m['channel']}",
         f"📌 الحالة: {m['status']}"
     ]
-    if m.get("score") and m["score"] != "0 - 0":
+    if m.get("score") and m["score"] != "0-0":
         lines.append(f"🔢 النتيجة: {m['score']}")
     match_link = m.get("url", BASE)
     lines.append(f'🔗 <a href="{match_link}">رابط البث / المباراة</a>')
@@ -348,17 +308,15 @@ async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ Background Schedulers ============
 async def background_cache_worker():
-    """تحديث الكاش تلقائياً كل 5 دقائق في الخلفية بدون انتظار دخول الزوار"""
     while True:
         try:
             await asyncio.get_event_loop().run_in_executor(None, update_cache)
         except Exception as e:
             logging.error("Worker error: %s", e)
-        await asyncio.sleep(300) # 300 ثانية = 5 دقائق
+        await asyncio.sleep(300)
 
 async def keep_awake_worker():
-    """إرسال طلب خارجي ذاتي كل 9 دقائق لمنع Render من النوم نهائياً"""
-    await asyncio.sleep(60) # انتظر دقيقة بعد الإقلاع
+    await asyncio.sleep(60)
     while True:
         try:
             ping_url = f"{SELF_URL}/"
@@ -367,7 +325,7 @@ async def keep_awake_worker():
                     logging.info("Keep-Awake Ping sent to %s, status: %d", ping_url, resp.status)
         except Exception as e:
             logging.warning("Keep-Awake Ping error: %s", e)
-        await asyncio.sleep(540) # كل 9 دقائق (أقل من الـ 15 دقيقة المحددة للخمول)
+        await asyncio.sleep(540)
 
 # ============ Main Entry ============
 async def main_async():
@@ -381,7 +339,6 @@ async def main_async():
     await site.start()
     logging.info("🚀 Web API Server is running on http://%s:%d/api/matches", HOST, PORT)
 
-    # تشغيل مهمة التحديث التلقائي ومهمة إبقاء السيرفر صاحياً في الخلفية
     asyncio.create_task(background_cache_worker())
     asyncio.create_task(keep_awake_worker())
 

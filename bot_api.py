@@ -1,16 +1,4 @@
-[bot_cloud.py](https://github.com/user-attachments/files/34518463/bot_cloud.py)
 # -*- coding: utf-8 -*-
-"""
-Kora Live - Cloud Sync Bot (Smart Solution)
--------------------------------------------------------
-يقوم هذا السكربت تلقائياً بما يلي:
-1. جلب مباريات اليوم والغد والأمس من DotSport.
-2. تصفية مباريات الدوريات الست الكبرى في أوروبا ودوري روشن السعودي فقط.
-3. رفع ملف البيانات (JSON) تلقائياً كل 5 دقائق إلى خدمة سحابية آمنة ومجانية تدعم HTTPS و CORS (JSONBlob).
-4. طباعة الرابط المباشر في لوحة التحكم وإرساله في تيليجرام عند طلب /api أو /start.
-5. لا يحتاج لفتح منافذ (Ports) ولا يتأثر بنوع الاستضافة، ويعمل حتى على Pella أو أي استضافة بوتات مجانية.
-"""
-
 import os
 import re
 import io
@@ -21,16 +9,15 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= Configuration =================
 BASE = "https://dootsport.co/"
 TOKEN = os.getenv("BOT_TOKEN", "8756140722:AAFIr-OXKcdGQQb7nL0CD14fdgjLvlwJdAQ").strip()
-
-# ملف حفظ رابط السحابة حتى لا يتغير عند إعادة التشغيل
-URL_FILE = "blob_url.txt"
-CLOUD_URL = os.getenv("CLOUD_URL", "").strip()
+PORT = int(os.getenv("PORT", 8080))
+HOST = "0.0.0.0"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
@@ -42,7 +29,6 @@ TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b", re.I)
 SCORE_RE = re.compile(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# قائمة الكلمات المفتاحية للدوريات المستهدفة
 TARGET_KEYWORDS = [
     "إنجليزي", "انجليزي", "premier league", "بريميرليج", "انجلترا", "إنجلترا",
     "إسباني", "اسباني", "la liga", "لاليغا", "إسبانيا", "اسبانيا",
@@ -210,69 +196,9 @@ def scrape_day(day, urls):
             logging.warning("Scrape error on %s: %s", url, e)
     return out
 
-# ============ Cloud Sync (Smart JSONBlob Engine) ============
-def get_or_create_cloud_blob(payload):
-    global CLOUD_URL
-    # 1. فحص إذا كان الرابط محفوظاً مسبقاً
-    if not CLOUD_URL and os.path.exists(URL_FILE):
-        try:
-            with open(URL_FILE, "r", encoding="utf-8") as f:
-                saved = f.read().strip()
-                if saved.startswith("http"):
-                    CLOUD_URL = saved
-        except Exception:
-            pass
-
-    # 2. إذا لم يكن موجوداً، نقوم بإنشاء مساحة سحابية جديدة على JSONBlob
-    if not CLOUD_URL:
-        try:
-            logging.info("Creating a new Cloud Storage endpoint on JSONBlob...")
-            r = requests.post(
-                "https://jsonblob.com/api/jsonBlob",
-                json=payload,
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-                timeout=15
-            )
-            if r.status_code in [200, 201]:
-                loc = r.headers.get("Location") or r.headers.get("x-jsonblob-id")
-                if loc:
-                    if not loc.startswith("http"):
-                        loc = "https://jsonblob.com/api/jsonBlob/" + loc
-                    CLOUD_URL = loc
-                    with open(URL_FILE, "w", encoding="utf-8") as f:
-                        f.write(CLOUD_URL)
-                    print("\n" + "="*70)
-                    print("🚀 تم إنشاء رابط سحابي مشفر (HTTPS) بنجاح لمدونة بلوجر:")
-                    print(f"👉 {CLOUD_URL}")
-                    print("="*70 + "\n")
-                    return True
-        except Exception as e:
-            logging.error("Failed to create initial cloud blob: %s", e)
-            return False
-
-    # 3. إذا كان الرابط موجوداً، نقوم بتحديث البيانات عليه بطلب PUT
-    else:
-        try:
-            r = requests.put(
-                CLOUD_URL,
-                json=payload,
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-                timeout=15
-            )
-            if r.status_code in [200, 201]:
-                logging.info("Cloud JSON updated successfully -> %s", CLOUD_URL)
-                return True
-            else:
-                logging.warning("Cloud PUT returned status %s, re-creating blob...", r.status_code)
-                CLOUD_URL = ""
-                return get_or_create_cloud_blob(payload)
-        except Exception as e:
-            logging.error("Failed to update cloud blob: %s", e)
-            return False
-
-def update_and_sync():
+def update_cache():
     try:
-        logging.info("Scraping matches from DotSport...")
+        logging.info("Updating matches cache from DotSport...")
         soup = BeautifulSoup(fetch(BASE), "html.parser")
         links = day_links(soup)
         yesterday_data = scrape_day("yesterday", links)
@@ -283,24 +209,10 @@ def update_and_sync():
         MATCHES_CACHE["today"] = today_data
         MATCHES_CACHE["tomorrow"] = tomorrow_data
         MATCHES_CACHE["last_updated"] = time.time()
-
-        payload = {
-            "status": "success",
-            "last_updated": MATCHES_CACHE["last_updated"],
-            "counts": {
-                "yesterday": len(yesterday_data),
-                "today": len(today_data),
-                "tomorrow": len(tomorrow_data)
-            },
-            "matches": {
-                "yesterday": yesterday_data,
-                "today": today_data,
-                "tomorrow": tomorrow_data
-            }
-        }
-        get_or_create_cloud_blob(payload)
+        logging.info("Cache successfully updated! (Yesterday: %d, Today: %d, Tomorrow: %d)",
+                     len(yesterday_data), len(today_data), len(tomorrow_data))
     except Exception as e:
-        logging.error("Scrape & Sync error: %s", e)
+        logging.error("Failed to update cache: %s", e)
 
 # ============ Image Combine ============
 def download_image(url, timeout=10):
@@ -334,6 +246,44 @@ def combine_logos(logo1_url, logo2_url, size=180):
     buf.seek(0)
     return buf
 
+# ============ HTTP REST API Server ============
+async def api_get_matches(request):
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Cache-Control": "public, max-age=60",
+    }
+    if time.time() - MATCHES_CACHE["last_updated"] > 300:
+        asyncio.get_event_loop().run_in_executor(None, update_cache)
+
+    payload = {
+        "status": "success",
+        "last_updated": MATCHES_CACHE["last_updated"],
+        "counts": {
+            "yesterday": len(MATCHES_CACHE["yesterday"]),
+            "today": len(MATCHES_CACHE["today"]),
+            "tomorrow": len(MATCHES_CACHE["tomorrow"])
+        },
+        "matches": {
+            "yesterday": MATCHES_CACHE["yesterday"],
+            "today": MATCHES_CACHE["today"],
+            "tomorrow": MATCHES_CACHE["tomorrow"]
+        }
+    }
+    return web.json_response(payload, headers=headers)
+
+async def api_options(request):
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+    return web.Response(status=200, headers=headers)
+
+async def api_health(request):
+    return web.Response(text="Bot & API Server is Healthy and Running ⚽", status=200)
+
 # ============ Telegram Bot Handlers ============
 def match_caption(i, m):
     title = f"{m['team1']} VS {m['team2']}"
@@ -346,7 +296,7 @@ def match_caption(i, m):
     ]
     if m.get("score") and m["score"] != "0 - 0":
         lines.append(f"🔢 النتيجة: {m['score']}")
-    lines.append(f'🔗 <a href="{m['url']}">رابط البث / المباراة</a>')
+    lines.append(f'🔗 <a href="{m[\'url\']}">رابط البث / المباراة</a>')
     return "\n".join(lines)
 
 async def send_matches_to_tg(update: Update, label, matches):
@@ -373,68 +323,65 @@ async def send_matches_to_tg(update: Update, label, matches):
 
 async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("⏳ مرحباً بك! جارٍ جلب أهم مباريات اليوم وتحديث الرابط السحابي للمدونة...")
+        await update.message.reply_text("⏳ مرحباً بك! جارٍ جلب أهم مباريات الدوريات الكبرى والدوري السعودي...")
     if time.time() - MATCHES_CACHE["last_updated"] > 300 or not MATCHES_CACHE["today"]:
-        await asyncio.get_event_loop().run_in_executor(None, update_and_sync)
-
+        await asyncio.get_event_loop().run_in_executor(None, update_cache)
     await send_matches_to_tg(update, "اليوم", MATCHES_CACHE["today"])
     await send_matches_to_tg(update, "الغد", MATCHES_CACHE["tomorrow"])
     await send_matches_to_tg(update, "الأمس", MATCHES_CACHE["yesterday"])
 
-    # إرسال رابط المدونة السحابي للمستخدم
-    if CLOUD_URL and update.message:
+async def tg_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
         await update.message.reply_text(
-            f"🌐 <b>رابط السحابة لمدونتك (HTTPS):</b>\n<code>{CLOUD_URL}</code>\n\n"
-            "انسخ هذا الرابط وضعه في قالب بلوجر داخل <code>BOT_API_URL</code>.",
+            "⚽ <b>أوامر البوت:</b>\n\n"
+            "/start أو /matches — عرض مباريات اليوم والغد والأمس لأهم الدوريات\n"
+            "/api — رابط API المخصص للمدونة",
             parse_mode="HTML"
         )
 
-async def tg_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        if CLOUD_URL:
-            await update.message.reply_text(
-                f"🌐 <b>رابط API السحابي المباشر لمدونتك:</b>\n\n"
-                f"<code>{CLOUD_URL}</code>\n\n"
-                "هذا الرابط يعمل باتصال مشفر آمن HTTPS ويدعم CORS لمدونات بلوجر بنسبة 100%.",
-                parse_mode="HTML"
-            )
-        else:
-            await update.message.reply_text("⏳ الرابط قيد الإنشاء الآن، يرجى إعادة إرسال /api بعد بضع ثوانٍ...")
-
-# ============ Scheduler & Main ============
-async def sync_loop():
+# ============ Background Scheduler ============
+async def background_cache_worker():
     while True:
         try:
-            await asyncio.get_event_loop().run_in_executor(None, update_and_sync)
+            await asyncio.get_event_loop().run_in_executor(None, update_cache)
         except Exception as e:
-            logging.error("Sync worker error: %s", e)
-        await asyncio.sleep(300) # التحديث والرفع كل 5 دقائق
+            logging.error("Worker error: %s", e)
+        await asyncio.sleep(300)
 
-async def main():
-    # تشغيل التحديث الأول في الخلفية
-    asyncio.create_task(sync_loop())
+# ============ Main Entry ============
+async def main_async():
+    app_web = web.Application()
+    app_web.router.add_get("/", api_health)
+    app_web.router.add_get("/api/matches", api_get_matches)
+    app_web.router.add_options("/api/matches", api_options)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    logging.info("🚀 Web API Server is running on http://%s:%d/api/matches", HOST, PORT)
 
-    if not TOKEN:
-        logging.warning("BOT_TOKEN is empty! Running in cloud sync mode only.")
+    asyncio.create_task(background_cache_worker())
+
+    if TOKEN:
+        tg_app = Application.builder().token(TOKEN).build()
+        tg_app.add_handler(CommandHandler("start", tg_start))
+        tg_app.add_handler(CommandHandler("matches", tg_start))
+        tg_app.add_handler(CommandHandler("help", tg_help))
+
+        logging.info("🤖 Starting Telegram Bot polling...")
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.updater.start_polling(drop_pending_updates=True)
+
+        while True:
+            await asyncio.sleep(3600)
+    else:
+        logging.warning("⚠️ BOT_TOKEN not set. Running in Web API Mode only.")
         while True:
             await asyncio.sleep(3600)
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", tg_start))
-    app.add_handler(CommandHandler("matches", tg_start))
-    app.add_handler(CommandHandler("api", tg_api))
-    app.add_handler(CommandHandler("link", tg_api))
-
-    logging.info("Telegram Bot is running...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    while True:
-        await asyncio.sleep(3600)
-
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(main_async())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Stopped.")
+        logging.info("Server stopped.")

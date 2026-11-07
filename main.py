@@ -296,7 +296,8 @@ def match_caption(i, m):
     ]
     if m.get("score") and m["score"] != "0 - 0":
         lines.append(f"🔢 النتيجة: {m['score']}")
-    lines.append(f'🔗 <a href="{m[\'url\']}">رابط البث / المباراة</a>')
+    match_link = m.get("url", BASE)
+    lines.append(f'🔗 <a href="{match_link}">رابط البث / المباراة</a>')
     return "\n".join(lines)
 
 async def send_matches_to_tg(update: Update, label, matches):
